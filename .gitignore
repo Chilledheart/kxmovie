@@ -1,12 +1,23 @@
+# OS X
+.DS_Store
 
-## xcode specific
-build/*
+# Xcode
+build/
 *.pbxuser
-*.mode2v3
+!default.pbxuser
 *.mode1v3
-*.perspective
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
 *.perspectivev3
-*~.nib
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+profile
+*.moved-aside
+DerivedData
+*.hmap
+*.ipa
 
 ## ignore private workspace stuff added by Xcode4
 xcuserdata
@@ -26,5 +37,8 @@ libs/FFmpeg/*
 output/*
 plan
 
-
 KxMovieExample/SampleMovies/*
+
+# CocoaPods
+Pods
+
