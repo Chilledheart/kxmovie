@@ -22,6 +22,7 @@ typedef enum {
     kxMovieErrorStreamNotFound,
     kxMovieErrorCodecNotFound,
     kxMovieErrorOpenCodec,
+    kxMovieErrorOpenFilter,
     kxMovieErrorAllocateFrame,
     kxMovieErroSetupScaler,
     kxMovieErroReSampler,

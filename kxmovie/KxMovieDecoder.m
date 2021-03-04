@@ -15,6 +15,11 @@
 #include "libswscale/swscale.h"
 #include "libswresample/swresample.h"
 #include "libavutil/pixdesc.h"
+#include "libavcodec/avcodec.h"
+#include "libavformat/avformat.h"
+#include "libavfilter/buffersink.h"
+#include "libavfilter/buffersrc.h"
+#include "libavutil/opt.h"
 #import "KxAudioManager.h"
 #import "KxLogger.h"
 
@@ -422,6 +427,9 @@ static int interrupt_callback(void *ctx);
     KxVideoFrameFormat  _videoFrameFormat;
     NSUInteger          _artworkStream;
     NSInteger           _subtitleASSEvents;
+    AVFilterContext     *_buffersink_ctx;
+    AVFilterContext     *_buffersrc_ctx;
+    AVFilterGraph       *_filter_graph;
 }
 @end
 
@@ -780,14 +788,14 @@ static int interrupt_callback(void *ctx);
     }
     
     if (avformat_open_input(&formatCtx, [path cStringUsingEncoding: NSUTF8StringEncoding], NULL, NULL) < 0) {
-        
+        av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
         if (formatCtx)
             avformat_free_context(formatCtx);
         return kxMovieErrorOpenFile;
     }
     
     if (avformat_find_stream_info(formatCtx, NULL) < 0) {
-        
+        av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
         avformat_close_input(&formatCtx);
         return kxMovieErrorStreamInfoNotFound;
     }
@@ -824,7 +832,7 @@ static int interrupt_callback(void *ctx);
 }
 
 - (kxMovieError) openVideoStream: (NSInteger) videoStream
-{    
+{
     // get a pointer to the codec context for the video stream
     AVCodecContext *codecCtx = _formatCtx->streams[videoStream]->codec;
     
@@ -857,9 +865,13 @@ static int interrupt_callback(void *ctx);
     AVStream *st = _formatCtx->streams[_videoStream];
     avStreamFPSTimeBase(st, 0.04, &_fps, &_videoTimeBase);
     
+    // Setup video filters
+    if (![self setupFilters:"yadif=1:-1"])
+        return kxMovieErrorOpenFilter;
+
     LoggerVideo(1, @"video codec size: %d:%d fps: %.3f tb: %f",
-                self.frameWidth,
-                self.frameHeight,
+                (int)self.frameWidth,
+                (int)self.frameHeight,
                 _fps,
                 _videoTimeBase);
     
@@ -993,6 +1005,8 @@ static int interrupt_callback(void *ctx);
 
 -(void) closeFile
 {
+
+    
     [self closeAudioStream];
     [self closeVideoStream];
     [self closeSubtitleStream];
@@ -1009,6 +1023,17 @@ static int interrupt_callback(void *ctx);
         avformat_close_input(&_formatCtx);
         _formatCtx = NULL;
     }
+
+    if (_videoFrame) {
+        av_frame_free(&_videoFrame);
+        _videoFrame = NULL;
+    }
+
+    if (_audioFrame) {
+        
+        av_frame_free(&_audioFrame);
+        _audioFrame = NULL;
+    }
 }
 
 - (void) closeVideoStream
@@ -1017,10 +1042,8 @@ static int interrupt_callback(void *ctx);
     
     [self closeScaler];
     
-    if (_videoFrame) {
-        
-        av_free(_videoFrame);
-        _videoFrame = NULL;
+    if (_filter_graph) {
+        avfilter_graph_free(&_filter_graph);
     }
     
     if (_videoCodecCtx) {
@@ -1046,12 +1069,6 @@ static int interrupt_callback(void *ctx);
         swr_free(&_swrContext);
         _swrContext = NULL;
     }
-        
-    if (_audioFrame) {
-        
-        av_free(_audioFrame);
-        _audioFrame = NULL;
-    }
     
     if (_audioCodecCtx) {
         
@@ -1066,7 +1083,7 @@ static int interrupt_callback(void *ctx);
     
     if (_subtitleCodecCtx) {
         
-        avcodec_close(_subtitleCodecCtx);
+        avcodec_free_context(&_subtitleCodecCtx);
         _subtitleCodecCtx = NULL;
     }
 }
@@ -1089,7 +1106,7 @@ static int interrupt_callback(void *ctx);
     [self closeScaler];
     
     _pictureValid = avpicture_alloc(&_picture,
-                                    PIX_FMT_RGB24,
+                                    AV_PIX_FMT_RGB24,
                                     _videoCodecCtx->width,
                                     _videoCodecCtx->height) == 0;
     
@@ -1102,12 +1119,105 @@ static int interrupt_callback(void *ctx);
                                        _videoCodecCtx->pix_fmt,
                                        _videoCodecCtx->width,
                                        _videoCodecCtx->height,
-                                       PIX_FMT_RGB24,
+                                       AV_PIX_FMT_RGB24,
                                        SWS_FAST_BILINEAR,
                                        NULL, NULL, NULL);
         
     return _swsContext != NULL;
 }
+
+- (BOOL) setupFilters: (const char *)filters_descr
+{
+    char args[512];
+    int ret = 0;
+    const AVFilter *buffersrc  = avfilter_get_by_name("buffer");
+    const AVFilter *buffersink = avfilter_get_by_name("buffersink");
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs  = avfilter_inout_alloc();
+    AVRational time_base = _formatCtx->streams[_videoStream]->time_base;
+    enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE };
+
+    _filter_graph = avfilter_graph_alloc();
+    if (!outputs || !inputs || !_filter_graph) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot create input/output/graph\n");
+        ret = -1;
+        goto end;
+    }
+
+    /* buffer video source: the decoded frames from the decoder will be inserted here. */
+    snprintf(args, sizeof(args),
+            "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+            _videoCodecCtx->width, _videoCodecCtx->height, _videoCodecCtx->pix_fmt,
+            time_base.num, time_base.den,
+            _videoCodecCtx->sample_aspect_ratio.num, _videoCodecCtx->sample_aspect_ratio.den);
+
+    ret = avfilter_graph_create_filter(&_buffersrc_ctx, buffersrc, "in",
+                                       args, NULL, _filter_graph);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source\n");
+        goto end;
+    }
+
+    /* buffer video sink: to terminate the filter chain. */
+    ret = avfilter_graph_create_filter(&_buffersink_ctx, buffersink, "out",
+                                       NULL, NULL, _filter_graph);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot create buffer sink\n");
+        goto end;
+    }
+
+    ret = av_opt_set_int_list(_buffersink_ctx, "pix_fmts", pix_fmts,
+                              AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot set output pixel format\n");
+        goto end;
+    }
+
+    /*
+     * Set the endpoints for the filter graph. The filter_graph will
+     * be linked to the graph described by filters_descr.
+     */
+
+    /*
+     * The buffer source output must be connected to the input pad of
+     * the first filter described by filters_descr; since the first
+     * filter input label is not specified, it is set to "in" by
+     * default.
+     */
+    outputs->name       = av_strdup("in");
+    outputs->filter_ctx = _buffersrc_ctx;
+    outputs->pad_idx    = 0;
+    outputs->next       = NULL;
+
+    /*
+     * The buffer sink input must be connected to the output pad of
+     * the last filter described by filters_descr; since the last
+     * filter output label is not specified, it is set to "out" by
+     * default.
+     */
+    inputs->name       = av_strdup("out");
+    inputs->filter_ctx = _buffersink_ctx;
+    inputs->pad_idx    = 0;
+    inputs->next       = NULL;
+
+    if ((ret = avfilter_graph_parse_ptr(_filter_graph, filters_descr,
+                                        &inputs, &outputs, NULL)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot put filter: %s\n", filters_descr);
+        goto end;
+    }
+
+    if ((ret = avfilter_graph_config(_filter_graph, NULL)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot config graph: %s\n", filters_descr);
+        goto end;
+    }
+
+end:
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+
+    return ret >= 0;
+}
+
 
 - (KxVideoFrame *) handleVideoFrame
 {
@@ -1373,35 +1483,55 @@ static int interrupt_callback(void *ctx);
             break;
         }
         
-        if (packet.stream_index ==_videoStream) {
-           
-            int pktSize = packet.size;
+        if (packet.stream_index == _videoStream) {
+            int len = avcodec_send_packet(_videoCodecCtx, &packet);
             
-            while (pktSize > 0) {
-                            
-                int gotframe = 0;
-                int len = avcodec_decode_video2(_videoCodecCtx,
-                                                _videoFrame,
-                                                &gotframe,
-                                                &packet);
-                
-                if (len < 0) {
-                    LoggerVideo(0, @"decode video error, skip packet");
+            if (len < 0) {
+                av_log(NULL, AV_LOG_ERROR, "Error while sending a packet to the decoder\n");
+                break;
+            }
+            
+            while (len >= 0) {
+                len = avcodec_receive_frame(_videoCodecCtx, _videoFrame);
+                if (len == AVERROR(EAGAIN) || len == AVERROR_EOF) {
                     break;
+                } else if (len < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder\n");
+                    goto end;
                 }
-                
-                if (gotframe) {
-                    
-                    if (!_disableDeinterlacing &&
-                        _videoFrame->interlaced_frame) {
 
-                        avpicture_deinterlace((AVPicture*)_videoFrame,
-                                              (AVPicture*)_videoFrame,
-                                              _videoCodecCtx->pix_fmt,
-                                              _videoCodecCtx->width,
-                                              _videoCodecCtx->height);
+                _videoFrame->pts = _videoFrame->best_effort_timestamp;
+
+                if (!_disableDeinterlacing) {
+
+                    /* push the decoded frame into the filtergraph */
+                    if (av_buffersrc_add_frame_flags(_buffersrc_ctx, _videoFrame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
+                        av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
+                        break;
                     }
-                    
+
+                    /* pull filtered frames from the filtergraph */
+                    while (1) {
+                        int ret = av_buffersink_get_frame(_buffersink_ctx, _videoFrame);
+                        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                            break;
+                        if (ret < 0)
+                            goto end;
+                        
+                        KxVideoFrame *frame = [self handleVideoFrame];
+                        if (frame) {
+                            
+                            [result addObject:frame];
+                            
+                            _position = frame.position;
+                            decodedDuration += frame.duration;
+                            if (decodedDuration > minDuration)
+                                finished = YES;
+                        }
+                        av_frame_unref(_videoFrame);
+                    }
+                    av_frame_unref(_videoFrame);
+                } else {
                     KxVideoFrame *frame = [self handleVideoFrame];
                     if (frame) {
                         
@@ -1413,51 +1543,38 @@ static int interrupt_callback(void *ctx);
                             finished = YES;
                     }
                 }
-                                
-                if (0 == len)
-                    break;
-                
-                pktSize -= len;
             }
             
         } else if (packet.stream_index == _audioStream) {
                         
-            int pktSize = packet.size;
-            
-            while (pktSize > 0) {
-                
-                int gotframe = 0;
-                int len = avcodec_decode_audio4(_audioCodecCtx,
-                                                _audioFrame,                                                
-                                                &gotframe,
-                                                &packet);
-                
-                if (len < 0) {
-                    LoggerAudio(0, @"decode audio error, skip packet");
+            int len = avcodec_send_packet(_audioCodecCtx, &packet);
+            if (len < 0) {
+                av_log(NULL, AV_LOG_ERROR, "Error while sending a packet to the decoder\n");
+                break;
+            }
+
+            while (len >= 0) {
+                len = avcodec_receive_frame(_audioCodecCtx, _audioFrame);
+                if (len == AVERROR(EAGAIN) || len == AVERROR_EOF) {
                     break;
+                } else if (len < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder\n");
+                    goto end;
                 }
-                
-                if (gotframe) {
                     
-                    KxAudioFrame * frame = [self handleAudioFrame];
-                    if (frame) {
+                KxAudioFrame * frame = [self handleAudioFrame];
+                if (frame) {
+                    
+                    [result addObject:frame];
+                                            
+                    if (_videoStream == -1) {
                         
-                        [result addObject:frame];
-                                                
-                        if (_videoStream == -1) {
-                            
-                            _position = frame.position;
-                            decodedDuration += frame.duration;
-                            if (decodedDuration > minDuration)
-                                finished = YES;
-                        }
+                        _position = frame.position;
+                        decodedDuration += frame.duration;
+                        if (decodedDuration > minDuration)
+                            finished = YES;
                     }
                 }
-                
-                if (0 == len)
-                    break;
-                
-                pktSize -= len;
             }
             
         } else if (packet.stream_index == _artworkStream) {
@@ -1503,8 +1620,10 @@ static int interrupt_callback(void *ctx);
             }
         }
 
-        av_free_packet(&packet);
+        av_packet_unref(&packet);
 	}
+    
+end:
 
     return result;
 }
